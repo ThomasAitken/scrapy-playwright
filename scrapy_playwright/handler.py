@@ -83,6 +83,7 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
         # read settings
         self.launch_options = settings.getdict("PLAYWRIGHT_LAUNCH_OPTIONS") or {}
         self.context_args = settings.getdict("PLAYWRIGHT_CONTEXT_ARGS") or {}
+        self.max_concurrent_pages = settings.getint("PLAYWRIGHT_MAX_CONCURRENT_PAGES") or None
         self.default_navigation_timeout = (
             settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT") or None
         )
@@ -107,6 +108,7 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
         logger.info("Browser context started")
         if self.default_navigation_timeout:
             self.context.set_default_navigation_timeout(self.default_navigation_timeout)
+        self.stats.set_value("playwright/page_count/max_concurrent", 0)
 
     @inlineCallbacks
     def close(self) -> Deferred:
@@ -125,6 +127,10 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
         return super().download_request(request, spider)
 
     async def _download_request(self, request: Request, spider: Spider) -> Response:
+        max_concurrent_page_count = self.stats.get_value("playwright/page_count/max_concurrent")
+        if len(self.context.pages) > max_concurrent_page_count:
+            self.stats.set_value("playwright/page_count/max_concurrent", len(self.context.pages))
+
         page = request.meta.get("playwright_page")
         if not isinstance(page, Page):
             page = await self._create_page_for_request(request)
@@ -147,6 +153,12 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
             return result
 
     async def _create_page_for_request(self, request: Request) -> Page:
+        while (
+            self.max_concurrent_pages is not None
+            and len(self.context.pages) >= self.max_concurrent_pages
+        ):
+            logger.debug("Waiting to create page, %i currently open", len(self.context.pages))
+            await asyncio.sleep(0.5)
         page = await self.context.new_page()  # type: ignore
         self.stats.inc_value("playwright/page_count")
         if self.default_navigation_timeout:
