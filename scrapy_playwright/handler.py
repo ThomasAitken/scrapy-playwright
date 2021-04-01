@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from functools import partial
 from time import time
 from typing import Callable, Optional, Type, TypeVar
 from urllib.parse import urlparse
@@ -17,6 +18,7 @@ from scrapy.utils.reactor import verify_installed_reactor
 from twisted.internet.defer import Deferred, inlineCallbacks
 
 from scrapy_playwright.page import PageCoroutine
+from scrapy_playwright.signals import page_opened, page_closed
 
 
 __all__ = ["ScrapyPlaywrightDownloadHandler"]
@@ -78,11 +80,15 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
         super().__init__(settings=settings, crawler=crawler)
         verify_installed_reactor("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
         crawler.signals.connect(self._engine_started, signals.engine_started)
+        self.crawler = crawler
         self.stats = crawler.stats
 
         # read settings
         self.launch_options = settings.getdict("PLAYWRIGHT_LAUNCH_OPTIONS") or {}
         self.context_args = settings.getdict("PLAYWRIGHT_CONTEXT_ARGS") or {}
+        self.max_concurrent_pages = (
+            crawler.settings.getint("PLAYWRIGHT_MAX_CONCURRENT_PAGES") or None
+        )
         self.default_navigation_timeout = (
             settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT") or None
         )
@@ -107,6 +113,7 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
         logger.info("Browser context started")
         if self.default_navigation_timeout:
             self.context.set_default_navigation_timeout(self.default_navigation_timeout)
+        self.stats.set_value("playwright/page_count/max_concurrent", 0)
 
     @inlineCallbacks
     def close(self) -> Deferred:
@@ -127,7 +134,7 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
     async def _download_request(self, request: Request, spider: Spider) -> Response:
         page = request.meta.get("playwright_page")
         if not isinstance(page, Page):
-            page = await self._create_page_for_request(request)
+            page = await self._create_page_for_request(request, spider)
         await page.unroute("**")
         await page.route(
             "**",
@@ -146,12 +153,29 @@ class ScrapyPlaywrightDownloadHandler(HTTPDownloadHandler):
         else:
             return result
 
-    async def _create_page_for_request(self, request: Request) -> Page:
+    async def _create_page_for_request(self, request: Request, spider: Spider) -> Page:
         page = await self.context.new_page()  # type: ignore
         self.stats.inc_value("playwright/page_count")
+        self.crawler.signals.send_catch_log(
+            signal=page_opened,
+            page=page,
+            request=request,
+            spider=spider,
+        )
+        self._update_stats()
+        page.on("close", partial(self._close_page_callback, page=page, spider=spider))
         if self.default_navigation_timeout:
             page.set_default_navigation_timeout(self.default_navigation_timeout)
         return page
+
+    def _close_page_callback(self, page: Page, spider: Spider) -> None:
+        self.crawler.signals.send_catch_log(signal=page_closed, page=page, spider=spider)
+        self._update_stats()
+
+    def _update_stats(self) -> None:
+        key = "playwright/page_count/max_concurrent"
+        if len(self.context.pages) > self.stats.get_value(key):
+            self.stats.set_value(key, len(self.context.pages))
 
     async def _download_request_with_page(
         self, request: Request, spider: Spider, page: Page
